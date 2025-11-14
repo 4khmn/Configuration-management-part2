@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <package_name>serde</package_name>
+    <repository_url>https://github.com/serde-rs/serde</repository_url>
+    <test_mode>false</test_mode>
+    <test_repository_path></test_repository_path>
+    <output_file>dependency_graph.svg</output_file>
+</configuration>
