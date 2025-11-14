@@ -1,0 +1,18 @@
+digraph dependency_graph {
+    rankdir=TB;
+    node [shape=box, style=rounded];
+
+    "A" [color=blue, fontcolor=blue, penwidth=2];
+
+    "A" -> "B";
+    "A" -> "C";
+    "B" -> "D";
+    "B" -> "E";
+    "D" -> "G";
+    "G" -> "I";
+    "E" -> "H";
+    "H" -> "I";
+    "C" -> "D";
+    "C" -> "F";
+    "F" -> "H";
+}

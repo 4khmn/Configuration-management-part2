@@ -1,0 +1,16 @@
+digraph dependency_graph {
+    rankdir=TB;
+    node [shape=box, style=rounded];
+
+    "itoa" [color=blue, fontcolor=blue, penwidth=2];
+
+    "itoa" -> "no-panic";
+    "no-panic" -> "proc-macro2";
+    "no-panic" -> "quote";
+    "no-panic" -> "syn";
+    "proc-macro2" -> "unicode-ident";
+    "quote" -> "proc-macro2";
+    "syn" -> "proc-macro2";
+    "syn" -> "unicode-ident";
+    "syn" -> "quote";
+}

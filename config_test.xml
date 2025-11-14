@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
-    <package_name>tokio</package_name>
-    <repository_url>https://github.com/tokio-rs/tokio</repository_url>
+    <package_name>log</package_name>
+    <repository_url>https://github.com/rust-lang/log</repository_url>
+
     <test_mode>false</test_mode>
     <test_repository_path></test_repository_path>
-    <output_file>dependency_graph.svg</output_file>
-</configuration>
 
+    <output_file>log_graph.svg</output_file>
+</configuration>

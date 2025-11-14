@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""
+Инструмент визуализации графа зависимостей для менеджера пакетов.
+Этап 5: Визуализация графа зависимостей через Graphviz в SVG.
+"""
+import tempfile  # временные файлы
+import subprocess  # запуск внешних команд
+import shutil  # проверка наличия бинарей в PATH
+from pathlib import Path  # удобная работа с путями
+
+
 import json
 import urllib.request
 import urllib.error
@@ -155,7 +165,6 @@ class CargoDependencyReader:
         # Берем самую последнюю версию
         latest_version = versions[0]
         deps_url = f"https://crates.io/api/v1/crates/{package_name_lower}/{latest_version['num']}/dependencies"
-    
         try:
             req = urllib.request.Request(deps_url)
             req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -172,6 +181,8 @@ class CargoDependencyReader:
                 dep_name = dep.get("crate_id")
                 if dep_name:
                     dependencies.append(dep_name)
+
+    
         self.cache[package_name_lower] = dependencies
         return dependencies
 class TestRepositoryReader:
@@ -413,8 +424,145 @@ class DependencyGraph:
             raise DependencyError(f"Не удалось определить порядок загрузки для узлов: {remaining}")
         
         return result
+    
+    def to_dot(self, root_package: str) -> str:
+        """
+        Генерирует текстовое представление графа на языке диаграмм Graphviz (DOT).
+        
+        Args:
+            root_package: Корневой пакет для выделения в графе.
+        
+        Returns:
+            str: DOT представление графа.
+        """
+        lines = ["digraph dependency_graph {"]
+        lines.append("    rankdir=TB;")
+        lines.append("    node [shape=box, style=rounded];")
+        lines.append("")
+        
+        # Выделяем корневой пакет
+        lines.append(f'    "{root_package}" [color=blue, fontcolor=blue, penwidth=2];')
+        lines.append("")
+        
+        # Добавляем все узлы графа
+        all_nodes = self.get_all_nodes()
+        all_nodes.add(root_package)
+        
+        # Добавляем рёбра графа
+        for package, deps in self.graph.items():
+            for dep in deps:
+                # Выделяем циклы красным цветом
+                is_cycle = False
+                for cycle in self.cycles:
+                    if package in cycle and dep in cycle:
+                        is_cycle = True
+                        break
+                
+                if is_cycle:
+                    lines.append(f'    "{package}" -> "{dep}" [color=red, penwidth=2];')
+                else:
+                    lines.append(f'    "{package}" -> "{dep}";')
+        
+        # Добавляем изолированные узлы (без зависимостей и не являющиеся зависимостями)
+        isolated = all_nodes - set(self.graph.keys())
+        isolated = isolated - {dep for deps in self.graph.values() for dep in deps}
+        for node in isolated:
+            if node != root_package:
+                lines.append(f'    "{node}";')
+        
+        lines.append("}")
+        return "\n".join(lines)
+    
+    def save_svg(self, root_package: str, output_file: str) -> None:
+        # Сохраняет изображение графа в формате SVG, пытаясь несколько стратегий:
+        # 1) системный `dot` (Graphviz),
+        # 2) python-graphviz (.pipe),
+        # 3) если ничего нет — сохраняет .dot и выдаёт понятную ошибку.
+        # Генерируем DOT из текущего графа (вызов существующего метода)
+        dot_content = self.to_dot(root_package)  # строка DOT
+
+        # Создаём временный DOT файл, чтобы dot мог его прочитать (если понадобится)
+        tmp_dot = None  # переменная для пути временного файла
+        try:
+            # Открываем временный файл для записи DOT-контента
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.dot', delete=False, encoding='utf-8')
+            tmp_dot = tmp.name  # сохраняем путь к файлу
+            tmp.write(dot_content)  # записываем DOT в файл
+            tmp.close()  # закрываем файл (dot/graphviz будет читать файл по пути)
+
+            # Проверяем наличие системного исполняемого файла 'dot' в PATH
+            dot_exe = shutil.which('dot')  # путь к dot или None
+            if dot_exe:
+                # Если dot найден, то пытаемся вызвать его для генерации SVG
+                # Формируем команду: dot -Tsvg tmp_dot -o output_file
+                cmd = [dot_exe, '-Tsvg', tmp_dot, '-o', output_file]
+                # Запускаем команду, ограничиваем время выполнения, собираем stdout/stderr
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                # Если команда завершилась с ошибкой, выбрасываем DependencyError с текстом
+                if proc.returncode != 0:
+                    # Если dot вернул ошибку — поднимаем понятное исключение с stderr
+                    raise DependencyError(f"Graphviz (dot) завершился с ошибкой: {proc.stderr.strip()}")
+                # Успешно сгенерировали SVG через dot — возвращаемся
+                return
+
+            # Если dot не найден — пробуем python-библиотеку graphviz
+            try:
+                import graphviz  # попытка импортировать библиотеку graphviz
+            except Exception as e:
+                graphviz = None  # если не получилось — отметим, что библиотека недоступна
+
+            if graphviz:
+                try:
+                    # Используем graphviz.Source и pipe(format='svg') -> получаем байты SVG
+                    gv = graphviz.Source(dot_content)  # создаём источник графа
+                    svg_bytes = gv.pipe(format='svg')  # получаем SVG в виде байтов
+                    # Записываем байты в выходной файл
+                    with open(output_file, 'wb') as f_out:
+                        f_out.write(svg_bytes)
+                    # Успешно сгенерировали SVG через python-graphviz
+                    return
+                except Exception as e:
+                    # Если graphviz-python не смог отрендерить (часто из-за отсутствия бэкенда),
+                    # мы падаем в следующий блок, где сохраним .dot и сообщим, что делать.
+                    pass
+
+            # Если мы сюда попали — ни dot, ни graphviz-python не помогли.
+            # Сохраняем .dot рядом с желаемым output_file и даём инструкцию, как вручную получить SVG.
+            dot_file_fallback = Path(output_file).with_suffix('.dot')  # путь к файлу .dot
+            # Копируем временный .dot в dot_file_fallback (перезаписываем при необходимости)
+            try:
+                # Читаем временный файл и записываем в целевой .dot
+                with open(tmp_dot, 'r', encoding='utf-8') as src, open(dot_file_fallback, 'w', encoding='utf-8') as dst:
+                    dst.write(src.read())
+            except Exception:
+                # Если копирование по какой-то причине не удалось, всё равно попробуем записать напрямую
+                with open(dot_file_fallback, 'w', encoding='utf-8') as dst:
+                    dst.write(dot_content)
+
+            # Выдаём понятный DependencyError с инструкцией для пользователя
+            raise DependencyError(
+                "Невозможно автоматически сгенерировать SVG: не найден исполняемый 'dot' и/или не работает python-библиотека 'graphviz'.\n"
+                f"Файл с описанием графа сохранён как: {dot_file_fallback}\n\n"
+                "Установите Graphviz (системный бинарный 'dot'), например:\n"
+                "  Windows: скачайте и установите с https://graphviz.org/download/ (добавьте папку bin в PATH)\n"
+                "  macOS: brew install graphviz\n"
+                "  Linux: sudo apt-get install graphviz\n\n"
+                "После установки выполните вручную:\n"
+                f"  dot -Tsvg {dot_file_fallback} -o {output_file}\n\n"
+                "Либо установите python-библиотеку graphviz и обеспечьте доступность бэкенда:\n"
+                "  pip install graphviz\n"
+            )
+
+        finally:
+            # В finally пытаемся удалить временный файл .dot, если он был создан
+            try:
+                if tmp_dot:
+                    Path(tmp_dot).unlink()
+            except Exception:
+                # Игнорируем ошибки удаления — файл временный, пользователь может потереть вручную
+                pass
 def print_config(config: Dict[str, str]) -> None:
-    print("Параметры конфигурации:")
+    print("Параметры конфигурации:\n")
     for key, value in config.items():
         print(f"{key}: {value}")
 
@@ -427,8 +575,7 @@ def print_dependencies(package_name: str, dependencies: List[str]) -> None:
         print("Зависимости не найдены")
 
 def print_graph_info(graph: DependencyGraph, root_package: str) -> None:
-
-    print(f"Граф зависимостей для пакета '{root_package}':")
+    print(f"Граф зависимостей для пакета '{root_package}':\n")
     
     all_deps = graph.get_all_dependencies(root_package)
     print(f"\nВсего зависимостей (включая транзитивные): {len(all_deps)}")
@@ -438,7 +585,7 @@ def print_graph_info(graph: DependencyGraph, root_package: str) -> None:
             print(f"  {i}. {dep}")
     
     if graph.has_cycles():
-        print(f"\n  Обнаружены циклические зависимости: {len(graph.get_cycles())}")
+        print(f"\nОбнаружены циклические зависимости: {len(graph.get_cycles())}")
         for i, cycle in enumerate(graph.get_cycles(), 1):
             cycle_str = " -> ".join(cycle)
             print(f"  Цикл {i}: {cycle_str}")
@@ -458,9 +605,8 @@ def print_load_order(graph: DependencyGraph, root_package: str) -> None:
             marker = " ← корневой" if package == root_package else ""
             print(f"  {i}. {package}{marker}")
         
-       
     except DependencyError as e:
-        print(f"\n  {e}")
+        print(f"\n {e}")
         print("Порядок загрузки не может быть определен из-за циклических зависимостей.")
     
 
@@ -512,6 +658,30 @@ def main():
         
         # Этап 4: Порядок загрузки зависимостей
         print_load_order(dependency_graph, package_name)
+        
+        # Этап 5: Визуализация графа
+        output_file = config["output_file"]
+        print(f"\nГенерация визуализации графа...")
+        try:
+            dependency_graph.save_svg(package_name, output_file)
+            print(f"Визуализация сохранена в файл: {output_file}")
+            
+            # Выводим DOT представление для справки
+            dot_content = dependency_graph.to_dot(package_name)
+            dot_file = output_file.replace('.svg', '.dot')
+            with open(dot_file, 'w', encoding='utf-8') as f:
+                f.write(dot_content)
+            print(f"DOT представление сохранено в файл: {dot_file}")
+        except DependencyError as e:
+            print(f"{e}")
+            # Сохраняем хотя бы DOT файл
+            dot_content = dependency_graph.to_dot(package_name)
+            dot_file = output_file.replace('.svg', '.dot')
+            with open(dot_file, 'w', encoding='utf-8') as f:
+                f.write(dot_content)
+            print(f"DOT представление сохранено в файл: {dot_file}")
+            print("  Для генерации SVG установите Graphviz и запустите:")
+            print(f"  dot -Tsvg {dot_file} -o {output_file}")
         
     except ConfigError as e:
         print(f"Ошибка конфигурации: {e}", file=sys.stderr)

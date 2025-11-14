@@ -1,0 +1,39 @@
+digraph dependency_graph {
+    rankdir=TB;
+    node [shape=box, style=rounded];
+
+    "A" [color=blue, fontcolor=blue, penwidth=2];
+
+    "A" -> "B";
+    "A" -> "C";
+    "B" -> "D" [color=red, penwidth=2];
+    "B" -> "E";
+    "D" -> "H";
+    "D" -> "I" [color=red, penwidth=2];
+    "H" -> "P";
+    "P" -> "X";
+    "I" -> "Q";
+    "I" -> "N";
+    "I" -> "B" [color=red, penwidth=2];
+    "Q" -> "Y";
+    "N" -> "V";
+    "E" -> "J";
+    "E" -> "K";
+    "E" -> "H";
+    "J" -> "R" [color=red, penwidth=2];
+    "J" -> "V";
+    "J" -> "Q";
+    "R" -> "Z";
+    "R" -> "J" [color=red, penwidth=2];
+    "K" -> "S";
+    "C" -> "F";
+    "C" -> "G";
+    "F" -> "L";
+    "F" -> "M";
+    "L" -> "T";
+    "M" -> "U";
+    "G" -> "N";
+    "G" -> "O";
+    "G" -> "L";
+    "O" -> "W";
+}
