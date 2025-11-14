@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
 Инструмент визуализации графа зависимостей для менеджера пакетов.
-Этап 2: Сбор данных о зависимостях.
+Этап 5: Визуализация графа зависимостей через Graphviz в SVG.
 """
-
+import json
+import urllib.request
+import urllib.error
 import sys
 import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.error
 import ssl
 import re
+import subprocess
+import tempfile
 from pathlib import Path
-from typing import Dict, Optional, List
-
+from typing import Dict, Optional, List, Set
+from collections import defaultdict
 
 class ConfigError(Exception):
     """Исключение для ошибок конфигурации."""
     pass
-
 
 class ConfigReader:
     """Класс для чтения и валидации конфигурационного файла."""
@@ -119,226 +122,271 @@ class ConfigReader:
         if not output_file.endswith(('.svg', '.png', '.jpg', '.jpeg', '.pdf')):
             raise ConfigError(f"Некорректное расширение выходного файла: {output_file}")
 
-
 class DependencyError(Exception):
     """Исключение для ошибок получения зависимостей."""
     pass
 
-
 class CargoDependencyReader:
-    """Класс для чтения зависимостей из Cargo.toml файлов."""
+    """Чтение зависимостей пакета Rust через crates.io API с логами и защитой от зависаний."""
+
+    def __init__(self):
+        self.cache: dict[str, list[str]] = {}
+
+    def get_dependencies(self, package_name: str) -> list[str]:
+        package_name_lower = package_name.lower()
+        if package_name_lower in self.cache:
+            return self.cache[package_name_lower]
+
+        url = f"https://crates.io/api/v1/crates/{package_name_lower}"
+        
+        try:
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                         'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36')
+            req.add_header('Accept', 'application/json')
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.load(response)
+        except urllib.error.HTTPError as e:
+            raise DependencyError(f"Crate {package_name} не найден на crates.io: {e.code}")
+        except Exception as e:
+            raise DependencyError(f"Ошибка сети при получении {package_name}: {e}")
+
+        versions = data.get("versions", [])
+        if not versions:
+            print(f"[CargoDependencyReader] Пакет {package_name} не содержит версий, зависимостей нет")
+            self.cache[package_name_lower] = []
+            return []
+
+        # Берем самую последнюю версию
+        latest_version = versions[0]
+        deps_url = f"https://crates.io/api/v1/crates/{package_name_lower}/{latest_version['num']}/dependencies"
+        try:
+            req = urllib.request.Request(deps_url)
+            req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                         'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36')
+            req.add_header('Accept', 'application/json')
+            with urllib.request.urlopen(req, timeout=10) as response:
+                deps_data = json.load(response)
+        except Exception as e:
+            raise DependencyError(f"Ошибка при получении зависимостей {package_name}: {e}")
+
+        dependencies = []
+        for dep in deps_data.get("dependencies", []):
+            if dep.get("kind") in (None, "normal"):  # normal = обычная зависимость
+                dep_name = dep.get("crate_id")
+                if dep_name:
+                    dependencies.append(dep_name)
+
     
-    def __init__(self, repository_url: str):
-        self.repository_url = repository_url
-        self.cargo_toml_content = ""
+        self.cache[package_name_lower] = dependencies
+        return dependencies
+class TestRepositoryReader:
+    """Класс для чтения тестового репозитория из файла."""
+    
+    def __init__(self, file_path: str):
+        self.file_path = Path(file_path)
+        self.graph: Dict[str, List[str]] = {}
+    
+    def read_graph(self) -> Dict[str, List[str]]:
+        """
+        Читает граф зависимостей из файла.
+        
+        Формат файла:
+        A: B, C
+        B: D
+        C: D
+        D: E
+        
+        Returns:
+            Dict[str, List[str]]: Граф зависимостей (пакет -> список зависимостей).
+        
+        Raises:
+            DependencyError: Если файл не найден или содержит ошибки.
+        """
+        if not self.file_path.exists():
+            raise DependencyError(f"Файл тестового репозитория не найден: {self.file_path}")
+        
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            raise DependencyError(f"Ошибка чтения файла тестового репозитория: {e}")
+        
+        self.graph = {}
+        lines = content.strip().split('\n')
+        
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            # Пропускаем пустые строки и комментарии
+            if not line or line.startswith('#'):
+                continue
+            
+            # Формат: PACKAGE: DEP1, DEP2, DEP3
+            if ':' not in line:
+                raise DependencyError(f"Некорректный формат строки {line_num}: {line}")
+            
+            parts = line.split(':', 1)
+            package = parts[0].strip()
+            deps_str = parts[1].strip()
+            
+            # Валидация имени пакета (большие латинские буквы)
+            if not package.isupper() or not package.isalpha():
+                raise DependencyError(f"Некорректное имя пакета на строке {line_num}: {package}. "
+                                   f"Используйте большие латинские буквы.")
+            
+            # Парсим зависимости
+            dependencies = []
+            if deps_str:
+                deps = [d.strip() for d in deps_str.split(',')]
+                for dep in deps:
+                    if dep:
+                        # Валидация имени зависимости
+                        if not dep.isupper() or not dep.isalpha():
+                            raise DependencyError(f"Некорректное имя зависимости на строке {line_num}: {dep}. "
+                                                 f"Используйте большие латинские буквы.")
+                        dependencies.append(dep)
+            
+            self.graph[package] = dependencies
+        
+        return self.graph
     
     def get_dependencies(self, package_name: str) -> List[str]:
         """
-        Получает список прямых зависимостей для указанного пакета.
+        Получает прямые зависимости пакета из тестового графа.
         
         Args:
-            package_name: Имя пакета для анализа.
+            package_name: Имя пакета.
         
         Returns:
-            List[str]: Список имен зависимостей.
-        
-        Raises:
-            DependencyError: Если не удалось получить или распарсить зависимости.
+            List[str]: Список зависимостей.
         """
-        # Пробуем сначала корневой Cargo.toml
-        branch = "main"
-        cargo_toml_url = self._get_cargo_toml_url(branch=branch)
-        
-        try:
-            self.cargo_toml_content = self._fetch_cargo_toml(cargo_toml_url)
-            # Проверяем, не workspace ли это
-            if '[workspace]' in self.cargo_toml_content:
-                # Если workspace, ищем Cargo.toml в подпапке с именем пакета
-                cargo_toml_url = self._get_cargo_toml_url(package_name, branch)
-                self.cargo_toml_content = self._fetch_cargo_toml(cargo_toml_url)
-        except DependencyError as e:
-            # Если не нашли в корне на main, пробуем master
-            if branch == "main":
-                branch = "master"
-                cargo_toml_url = self._get_cargo_toml_url(branch=branch)
-                try:
-                    self.cargo_toml_content = self._fetch_cargo_toml(cargo_toml_url)
-                    # Проверяем workspace
-                    if '[workspace]' in self.cargo_toml_content:
-                        cargo_toml_url = self._get_cargo_toml_url(package_name, branch)
-                        self.cargo_toml_content = self._fetch_cargo_toml(cargo_toml_url)
-                except DependencyError:
-                    # Если не нашли в корне, пробуем в подпапке
-                    try:
-                        cargo_toml_url = self._get_cargo_toml_url(package_name, branch)
-                        self.cargo_toml_content = self._fetch_cargo_toml(cargo_toml_url)
-                    except DependencyError:
-                        raise e
-            else:
-                # Если не нашли в корне, пробуем в подпапке
-                try:
-                    cargo_toml_url = self._get_cargo_toml_url(package_name, branch)
-                    self.cargo_toml_content = self._fetch_cargo_toml(cargo_toml_url)
-                except DependencyError:
-                    raise e
-        
-        try:
-            dependencies = self._parse_dependencies()
-            return dependencies
-        except Exception as e:
-            raise DependencyError(f"Ошибка парсинга зависимостей: {e}")
+        return self.graph.get(package_name.upper(), [])
+
+class DependencyGraph:
+    """Класс для построения и работы с графом зависимостей."""
     
-    def _get_cargo_toml_url(self, subpath: Optional[str] = None, branch: str = "main") -> str:
+    def __init__(self):
+        self.graph: Dict[str, List[str]] = defaultdict(list)
+        self.all_packages: Set[str] = set()
+        self.cycles: List[List[str]] = []
+    
+    def add_dependency(self, package: str, dependency: str) -> None:
+        """Добавляет зависимость в граф."""
+        self.graph[package].append(dependency)
+        self.all_packages.add(package)
+        self.all_packages.add(dependency)
+    
+    def build_graph_dfs(self, root_package: str, dependency_reader) -> None:
         """
-        Преобразует URL репозитория в URL для получения Cargo.toml.
+        Строит граф зависимостей используя DFS с рекурсией.
         
         Args:
-            subpath: Опциональный подпуть (например, имя пакета для workspace).
-            branch: Ветка репозитория (main или master).
+            root_package: Корневой пакет для построения графа.
+            dependency_reader: Объект для получения зависимостей (CargoDependencyReader или TestRepositoryReader).
         """
-        # Поддерживаем GitHub репозитории
-        # Формат: https://github.com/owner/repo
-        github_match = re.match(r'https?://github\.com/([^/]+)/([^/]+)/?', self.repository_url)
-        if github_match:
-            owner = github_match.group(1)
-            repo = github_match.group(2)
-            # Убираем .git если есть
-            repo = repo.rstrip('.git')
-            # Формируем путь
-            path = subpath + "/Cargo.toml" if subpath else "Cargo.toml"
-            return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+        visited: Set[str] = set()
+        recursion_stack: Set[str] = set()
+        current_path: List[str] = []
         
-        raise DependencyError(f"Неподдерживаемый формат URL репозитория: {self.repository_url}")
-    
-    def _fetch_cargo_toml(self, url: str) -> str:
-        """Загружает содержимое Cargo.toml по URL."""
-        try:
-            # Пробуем сначала с проверкой сертификата
-            ssl_context = None
+        def dfs(package: str) -> None:
+            """Рекурсивная функция DFS для обхода графа."""
+            if package in recursion_stack:
+                # Обнаружен цикл
+                cycle_start = current_path.index(package)
+                cycle = current_path[cycle_start:] + [package]
+                if cycle not in self.cycles:
+                    self.cycles.append(cycle)
+                return
+            
+            if package in visited:
+                return
+            
+            visited.add(package)
+            recursion_stack.add(package)
+            current_path.append(package)
+            
             try:
-                ssl_context = ssl.create_default_context()
-            except Exception:
+                dependencies = dependency_reader.get_dependencies(package)
+                for dep in dependencies:
+                    self.add_dependency(package, dep)
+                    dfs(dep)
+            except DependencyError:
+                # Если не удалось получить зависимости, просто пропускаем
                 pass
             
-            req = urllib.request.Request(url)
-            req.add_header('User-Agent', 'Mozilla/5.0')
-            
-            try:
-                if ssl_context:
-                    response = urllib.request.urlopen(req, timeout=10, context=ssl_context)
-                else:
-                    response = urllib.request.urlopen(req, timeout=10)
-            except ssl.SSLError:
-                # Если SSL ошибка, используем небезопасный контекст (для разработки)
-                ssl_context = ssl._create_unverified_context()
-                response = urllib.request.urlopen(req, timeout=10, context=ssl_context)
-            
-            with response:
-                content = response.read().decode('utf-8')
-                return content
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                # Пробуем другую ветку
-                if '/main/' in url:
-                    url = url.replace('/main/', '/master/')
-                    return self._fetch_cargo_toml(url)
-                elif '/master/' in url:
-                    # Если и master не работает, пробуем main
-                    url = url.replace('/master/', '/main/')
-                    return self._fetch_cargo_toml(url)
-                raise DependencyError(f"Cargo.toml не найден в репозитории (404)")
-            raise DependencyError(f"HTTP ошибка при получении Cargo.toml: {e.code}")
-        except urllib.error.URLError as e:
-            # Если это SSL ошибка, пробуем с небезопасным контекстом
-            if 'SSL' in str(e) or 'CERTIFICATE' in str(e):
-                try:
-                    ssl_context = ssl._create_unverified_context()
-                    req = urllib.request.Request(url)
-                    req.add_header('User-Agent', 'Mozilla/5.0')
-                    with urllib.request.urlopen(req, timeout=10, context=ssl_context) as response:
-                        content = response.read().decode('utf-8')
-                        return content
-                except Exception as e2:
-                    raise DependencyError(f"Ошибка сети при получении Cargo.toml: {e2}")
-            raise DependencyError(f"Ошибка сети при получении Cargo.toml: {e}")
-        except Exception as e:
-            raise DependencyError(f"Неожиданная ошибка при получении Cargo.toml: {e}")
+            recursion_stack.remove(package)
+            current_path.pop()
+        
+        dfs(root_package)
     
-    def _parse_dependencies(self) -> List[str]:
+    def get_all_dependencies(self, package: str) -> Set[str]:
         """
-        Парсит зависимости из содержимого Cargo.toml.
+        Получает все транзитивные зависимости пакета.
         
-        Обрабатывает форматы:
-        - serde = "1.0"
-        - tokio = { version = "1.0", features = ["full"] }
-        - my-crate = { path = "../my-crate" }
-        - [dependencies.serde]
+        Args:
+            package: Имя пакета.
+        
+        Returns:
+            Set[str]: Множество всех зависимостей (включая транзитивные).
         """
-        dependencies = []
-        lines = self.cargo_toml_content.split('\n')
+        visited: Set[str] = set()
         
-        in_dependencies_section = False
-        in_table_array = False
+        def collect_deps(pkg: str) -> None:
+            if pkg in visited:
+                return
+            visited.add(pkg)
+            for dep in self.graph.get(pkg, []):
+                collect_deps(dep)
         
-        for line in lines:
-            line = line.strip()
-            
-            # Пропускаем комментарии
-            if line.startswith('#') or not line:
-                continue
-            
-            # Проверяем начало секции [dependencies]
-            if line == '[dependencies]':
-                in_dependencies_section = True
-                in_table_array = False
-                continue
-            
-            # Проверяем конец секции dependencies (начало новой секции)
-            if line.startswith('[') and line != '[dependencies]':
-                if in_dependencies_section and not in_table_array:
-                    break
-                in_dependencies_section = False
-                in_table_array = False
-                continue
-            
-            # Проверяем таблицы вида [dependencies.serde]
-            table_match = re.match(r'\[dependencies\.([^\]]+)\]', line)
-            if table_match:
-                dep_name = table_match.group(1).strip('"\'')
-                if dep_name not in dependencies:
-                    dependencies.append(dep_name)
-                in_dependencies_section = True
-                in_table_array = True
-                continue
-            
-            # Парсим зависимости в секции [dependencies]
-            if in_dependencies_section:
-                # Формат: name = "version" или name = { ... }
-                dep_match = re.match(r'^([a-zA-Z0-9_-]+)\s*=', line)
-                if dep_match:
-                    dep_name = dep_match.group(1)
-                    # Включаем все зависимости, включая те что с path
-                    # (для этапа 2 нужно показать все прямые зависимости)
-                    if dep_name not in dependencies:
-                        dependencies.append(dep_name)
+        for dep in self.graph.get(package, []):
+            collect_deps(dep)
         
-        return sorted(dependencies)
-
-
+        return visited
+    
+    def has_cycles(self) -> bool:
+        """Проверяет наличие циклов в графе."""
+        return len(self.cycles) > 0
+    
+    def get_cycles(self) -> List[List[str]]:
+        """Возвращает список всех найденных циклов."""
+        return self.cycles
+    
+    def get_all_nodes(self) -> Set[str]:
+        """Возвращает все узлы графа."""
+        return self.all_packages.copy()
+    
 def print_config(config: Dict[str, str]) -> None:
     print("Параметры конфигурации:\n")
     for key, value in config.items():
         print(f"{key}: {value}")
 
-
 def print_dependencies(package_name: str, dependencies: List[str]) -> None:
-    print(f"Прямые зависимости пакета '{package_name}':")
+    print(f"Прямые зависимости пакета '{package_name}':\n")
     if dependencies:
         for i, dep in enumerate(dependencies, 1):
             print(f"{i}. {dep}")
     else:
         print("Зависимости не найдены")
 
+def print_graph_info(graph: DependencyGraph, root_package: str) -> None:
+    """Выводит информацию о построенном графе зависимостей."""
+    print("\n")
+    print(f"Граф зависимостей для пакета '{root_package}':")
+    
+    all_deps = graph.get_all_dependencies(root_package)
+    print(f"\nВсего зависимостей (включая транзитивные): {len(all_deps)}")
+    if all_deps:
+        print("Список всех зависимостей:")
+        for i, dep in enumerate(sorted(all_deps), 1):
+            print(f"  {i}. {dep}")
+    
+    if graph.has_cycles():
+        print(f"\n  Обнаружены циклические зависимости: {len(graph.get_cycles())}")
+        for i, cycle in enumerate(graph.get_cycles(), 1):
+            cycle_str = " -> ".join(cycle)
+            print(f"  Цикл {i}: {cycle_str}")
+    else:
+        print("\n Циклических зависимостей не обнаружено")
 
 def main():
     """Главная функция приложения."""
@@ -350,16 +398,42 @@ def main():
         config = reader.read_config()
         print_config(config)
         
-        # Этап 2: Получение зависимостей (только если не тестовый режим)
-        if config["test_mode"] != "true":
-            package_name = config["package_name"]
-            repository_url = config["repository_url"]
-            
-            print(f"\nПолучение зависимостей для пакета '{package_name}'...")
-            dependency_reader = CargoDependencyReader(repository_url)
-            dependencies = dependency_reader.get_dependencies(package_name)
-            print_dependencies(package_name, dependencies)
+        package_name = config["package_name"]
         
+        # Этап 3: Построение графа зависимостей
+        dependency_graph = DependencyGraph()
+        
+        if config["test_mode"] == "true":
+            # Тестовый режим: читаем из файла
+            test_file_path = config["test_repository_path"]
+            print(f"\nЧтение тестового репозитория из файла: {test_file_path}")
+            test_reader = TestRepositoryReader(test_file_path)
+            test_reader.read_graph()
+            
+            # Выводим прямые зависимости (для совместимости с этапом 2)
+            dependencies = test_reader.get_dependencies(package_name)
+            print_dependencies(package_name, dependencies)
+            
+            # Строим граф с помощью DFS
+            print(f"\nПостроение графа зависимостей для пакета '{package_name}'...")
+            dependency_graph.build_graph_dfs(package_name, test_reader)
+        else:
+            # Обычный режим: получаем из GitHub
+            repository_url = config["repository_url"]
+            print(f"\nПолучение зависимостей для пакета '{package_name}'...")
+            cargo_reader = CargoDependencyReader()
+            
+            # Выводим прямые зависимости (для совместимости с этапом 2)
+            dependencies = cargo_reader.get_dependencies(package_name)
+            print_dependencies(package_name, dependencies)
+            
+            # Строим граф с помощью DFS
+            print(f"\nПостроение графа зависимостей для пакета '{package_name}'...")
+            dependency_graph.build_graph_dfs(package_name, cargo_reader)
+        
+        # Выводим информацию о графе
+        print_graph_info(dependency_graph, package_name)
+    
     except ConfigError as e:
         print(f"Ошибка конфигурации: {e}", file=sys.stderr)
         sys.exit(1)
@@ -368,9 +442,11 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"Неожиданная ошибка: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
+
 

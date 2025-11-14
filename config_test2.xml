@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <package_name>A</package_name>
+    <repository_url></repository_url>
+    <test_mode>true</test_mode>
+    <test_repository_path>test_repository2.txt</test_repository_path>
+    <output_file>test_graph2.svg</output_file>
+</configuration>
+
