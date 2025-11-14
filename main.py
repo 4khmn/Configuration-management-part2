@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Инструмент визуализации графа зависимостей для менеджера пакетов.
-Этап 5: Визуализация графа зависимостей через Graphviz в SVG.
-"""
 import json
 import urllib.request
 import urllib.error
@@ -138,7 +134,6 @@ class CargoDependencyReader:
             return self.cache[package_name_lower]
 
         url = f"https://crates.io/api/v1/crates/{package_name_lower}"
-        
         try:
             req = urllib.request.Request(url)
             req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -160,6 +155,7 @@ class CargoDependencyReader:
         # Берем самую последнюю версию
         latest_version = versions[0]
         deps_url = f"https://crates.io/api/v1/crates/{package_name_lower}/{latest_version['num']}/dependencies"
+    
         try:
             req = urllib.request.Request(deps_url)
             req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -176,8 +172,6 @@ class CargoDependencyReader:
                 dep_name = dep.get("crate_id")
                 if dep_name:
                     dependencies.append(dep_name)
-
-    
         self.cache[package_name_lower] = dependencies
         return dependencies
 class TestRepositoryReader:
@@ -355,8 +349,72 @@ class DependencyGraph:
         """Возвращает все узлы графа."""
         return self.all_packages.copy()
     
+    def get_load_order(self, root_package: str) -> List[str]:
+        """
+        Получает порядок загрузки зависимостей для заданного пакета.
+        
+        Использует топологическую сортировку для определения порядка,
+        в котором должны быть загружены зависимости (зависимости загружаются
+        перед пакетами, которые от них зависят).
+        
+        Args:
+            root_package: Корневой пакет.
+        
+        Returns:
+            List[str]: Список пакетов в порядке загрузки.
+        
+        Raises:
+            DependencyError: Если в графе есть циклы (топологическая сортировка невозможна).
+        """
+        if self.has_cycles():
+            raise DependencyError("Невозможно определить порядок загрузки: обнаружены циклические зависимости")
+        
+        # Строим обратный граф (incoming edges) для топологической сортировки
+        in_degree: Dict[str, int] = defaultdict(int)
+        reverse_graph: Dict[str, List[str]] = defaultdict(list)
+        
+        # Инициализируем все узлы
+        all_nodes = self.get_all_nodes()
+        all_nodes.add(root_package)
+        for node in all_nodes:
+            in_degree[node] = 0
+        
+        # Строим обратный граф и считаем in-degree
+        for package, deps in self.graph.items():
+            for dep in deps:
+                reverse_graph[dep].append(package)
+                in_degree[package] += 1
+        
+        # Алгоритм Kahn для топологической сортировки
+        queue: List[str] = []
+        result: List[str] = []
+        
+        # Находим все узлы без входящих рёбер (листья графа)
+        for node in all_nodes:
+            if in_degree[node] == 0:
+                queue.append(node)
+        
+        while queue:
+            # Сортируем для детерминированного порядка
+            queue.sort()
+            node = queue.pop(0)
+            result.append(node)
+            
+            # Уменьшаем in-degree для всех зависимых пакетов
+            for dependent in reverse_graph[node]:
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    queue.append(dependent)
+        
+        # Проверяем, что все узлы обработаны
+        if len(result) != len(all_nodes):
+            # Это не должно произойти, если нет циклов, но на всякий случай
+            remaining = all_nodes - set(result)
+            raise DependencyError(f"Не удалось определить порядок загрузки для узлов: {remaining}")
+        
+        return result
 def print_config(config: Dict[str, str]) -> None:
-    print("Параметры конфигурации:\n")
+    print("Параметры конфигурации:")
     for key, value in config.items():
         print(f"{key}: {value}")
 
@@ -369,8 +427,7 @@ def print_dependencies(package_name: str, dependencies: List[str]) -> None:
         print("Зависимости не найдены")
 
 def print_graph_info(graph: DependencyGraph, root_package: str) -> None:
-    """Выводит информацию о построенном графе зависимостей."""
-    print("\n")
+
     print(f"Граф зависимостей для пакета '{root_package}':")
     
     all_deps = graph.get_all_dependencies(root_package)
@@ -386,7 +443,26 @@ def print_graph_info(graph: DependencyGraph, root_package: str) -> None:
             cycle_str = " -> ".join(cycle)
             print(f"  Цикл {i}: {cycle_str}")
     else:
-        print("\n Циклических зависимостей не обнаружено")
+        print("\nЦиклических зависимостей не обнаружено")
+    
+
+def print_load_order(graph: DependencyGraph, root_package: str) -> None:
+    print(f"Порядок загрузки зависимостей для пакета '{root_package}':\n")
+    
+    try:
+        load_order = graph.get_load_order(root_package)
+        
+        print(f"\nВсего пакетов для загрузки: {len(load_order)}")
+        print("\nПорядок загрузки:")
+        for i, package in enumerate(load_order, 1):
+            marker = " ← корневой" if package == root_package else ""
+            print(f"  {i}. {package}{marker}")
+        
+       
+    except DependencyError as e:
+        print(f"\n  {e}")
+        print("Порядок загрузки не может быть определен из-за циклических зависимостей.")
+    
 
 def main():
     """Главная функция приложения."""
@@ -433,7 +509,10 @@ def main():
         
         # Выводим информацию о графе
         print_graph_info(dependency_graph, package_name)
-    
+        
+        # Этап 4: Порядок загрузки зависимостей
+        print_load_order(dependency_graph, package_name)
+        
     except ConfigError as e:
         print(f"Ошибка конфигурации: {e}", file=sys.stderr)
         sys.exit(1)
