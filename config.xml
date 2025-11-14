@@ -6,3 +6,4 @@
     <test_repository_path></test_repository_path>
     <output_file>dependency_graph.svg</output_file>
 </configuration>
+
